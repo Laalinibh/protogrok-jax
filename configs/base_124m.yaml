@@ -1,0 +1,15 @@
+# Protogrok ~124M configuration (parity with the PyTorch notebook's 125.1M model)
+d_model: 768
+payload_dim: 384
+header_dim: 256
+packet_layers: 12
+session_layers: 4
+nhead: 12
+mlp_ratio: 4
+memory_slots: 8
+dropout_rate: 0.1
+
+proto_vocab: 132        # overridden at train time from the data
+num_classes: 2          # anomaly finetune (use 20 for traffic-class)
+dtype: float32
+param_dtype: float32

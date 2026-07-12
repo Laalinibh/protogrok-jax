@@ -1,0 +1,218 @@
+"""Protogrok model in Flax (linen).
+
+A faithful, production-grade JAX port of the PyTorch ``ProtogrokModel``:
+a two-stage (packet-level then session-level) Transformer over network
+flows, with a convolutional payload encoder, a structured header encoder,
+a protocol adapter, and a slot-attention "memory" module, feeding
+multi-task heads (anomaly / traffic-class / byte-decode).
+
+Shapes
+------
+payload_toks : int32 [B, T, L]   byte-token ids per packet
+headers      : int32 [B, 5]      [proto_id, sport_bucket, dport_bucket, s0, s1]
+proto_id     : int32 [B]         protocol id for the protocol adapter
+returns      : float [B, C]      task logits (C depends on ``task``)
+"""
+from __future__ import annotations
+
+from typing import Literal
+
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
+
+from models.config import PAD_ID, ProtogrokConfig
+
+Task = Literal["anomaly", "class", "protocol", "pooled"]
+
+
+def _dtypes(cfg: ProtogrokConfig):
+    return jnp.dtype(cfg.dtype), jnp.dtype(cfg.param_dtype)
+
+
+class PayloadEncoder(nn.Module):
+    """Per-packet byte encoder: embed -> +positional -> 2x Conv1d(GELU) -> avg-pool.
+
+    PyTorch parity: ``nn.Embedding(padding_idx=PAD_ID)`` + learned positions +
+    two ``Conv1d(k=3, pad=1)`` with GELU + ``AdaptiveAvgPool1d(1)`` (mean over L).
+    """
+
+    cfg: ProtogrokConfig
+
+    @nn.compact
+    def __call__(self, toks: jnp.ndarray) -> jnp.ndarray:  # [B, T, L] -> [B, T, E]
+        cfg = self.cfg
+        compute_dtype, param_dtype = _dtypes(cfg)
+        B, T, L = toks.shape
+        E = cfg.payload_dim
+
+        embed = nn.Embed(
+            num_embeddings=cfg.byte_vocab, features=E,
+            embedding_init=nn.initializers.normal(stddev=0.02),
+            param_dtype=param_dtype, name="emb",
+        )
+        pos = self.param("pos", nn.initializers.normal(stddev=1.0),
+                         (cfg.payload_max_len, E), param_dtype)
+
+        x = embed(toks.reshape(B * T, L)).astype(compute_dtype)          # [B*T, L, E]
+        # Emulate padding_idx: zero the embedding at PAD positions (forward parity).
+        pad_mask = (toks.reshape(B * T, L) != PAD_ID)[..., None].astype(compute_dtype)
+        x = x * pad_mask
+        x = x + pos[:L][None].astype(compute_dtype)                      # [B*T, L, E]
+
+        conv_kwargs = dict(features=E, kernel_size=(3,), padding="SAME",
+                           param_dtype=param_dtype, dtype=compute_dtype)
+        x = nn.gelu(nn.Conv(**conv_kwargs, name="conv0")(x), approximate=False)
+        x = nn.gelu(nn.Conv(**conv_kwargs, name="conv1")(x), approximate=False)
+        x = jnp.mean(x, axis=1)                                          # AdaptiveAvgPool1d(1)
+        return x.reshape(B, T, E)
+
+
+class HeaderEncoder(nn.Module):
+    """Structured header encoder: proto/port embeddings + scalar projection."""
+
+    cfg: ProtogrokConfig
+
+    @nn.compact
+    def __call__(self, headers: jnp.ndarray) -> jnp.ndarray:            # [B, 5] -> [B, H]
+        cfg = self.cfg
+        compute_dtype, param_dtype = _dtypes(cfg)
+        H = cfg.header_dim
+        half = H // 2
+
+        proto = nn.Embed(cfg.proto_vocab, H, param_dtype=param_dtype, name="proto_emb")(headers[:, 0])
+        port_emb = nn.Embed(4, half, param_dtype=param_dtype, name="port_emb")
+        sport = port_emb(headers[:, 1])
+        dport = port_emb(headers[:, 2])
+        scal = nn.Dense(half, param_dtype=param_dtype, dtype=compute_dtype, name="scalar")(
+            headers[:, 3:].astype(compute_dtype))
+        x = jnp.concatenate([proto.astype(compute_dtype), sport.astype(compute_dtype),
+                             dport.astype(compute_dtype), scal], axis=-1)
+        return nn.Dense(H, param_dtype=param_dtype, dtype=compute_dtype, name="out")(x)
+
+
+class TransformerBlock(nn.Module):
+    """Pre-norm Transformer block with full multi-head self-attention."""
+
+    cfg: ProtogrokConfig
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, *, deterministic: bool) -> jnp.ndarray:
+        cfg = self.cfg
+        compute_dtype, param_dtype = _dtypes(cfg)
+        hidden = cfg.d_model * cfg.mlp_ratio
+
+        h = nn.LayerNorm(param_dtype=param_dtype, dtype=compute_dtype, name="norm1")(x)
+        a = nn.MultiHeadDotProductAttention(
+            num_heads=cfg.nhead, qkv_features=cfg.d_model,
+            dropout_rate=cfg.dropout_rate, deterministic=deterministic,
+            param_dtype=param_dtype, dtype=compute_dtype, name="attn",
+        )(h)  # inputs_kv defaults to inputs_q -> self-attention
+        x = x + nn.Dropout(cfg.dropout_rate, deterministic=deterministic)(a)
+
+        h = nn.LayerNorm(param_dtype=param_dtype, dtype=compute_dtype, name="norm2")(x)
+        h = nn.Dense(hidden, param_dtype=param_dtype, dtype=compute_dtype, name="mlp0")(h)
+        h = nn.gelu(h, approximate=False)
+        h = nn.Dense(cfg.d_model, param_dtype=param_dtype, dtype=compute_dtype, name="mlp1")(h)
+        x = x + nn.Dropout(cfg.dropout_rate, deterministic=deterministic)(h)
+        return x
+
+
+class ProtocolAdapter(nn.Module):
+    """Adds a protocol embedding and a bottleneck adapter (down-ReLU-up)."""
+
+    cfg: ProtogrokConfig
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, proto_id: jnp.ndarray) -> jnp.ndarray:
+        cfg = self.cfg
+        compute_dtype, param_dtype = _dtypes(cfg)
+        pe = nn.Embed(cfg.proto_vocab, cfg.d_model, param_dtype=param_dtype,
+                      name="proto")(proto_id)[:, None, :].astype(compute_dtype)
+        ad = nn.Dense(cfg.bottleneck, param_dtype=param_dtype, dtype=compute_dtype, name="down")(x)
+        ad = nn.relu(ad)
+        ad = nn.Dense(cfg.d_model, param_dtype=param_dtype, dtype=compute_dtype, name="up")(ad)
+        return x + pe + ad
+
+
+class MemoryModule(nn.Module):
+    """Slot-attention session memory: pool packets into slots, broadcast back."""
+
+    cfg: ProtogrokConfig
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:                 # [B, T, D]
+        cfg = self.cfg
+        compute_dtype, param_dtype = _dtypes(cfg)
+        D = cfg.d_model
+        slots = self.param("slots", nn.initializers.normal(stddev=1.0),
+                           (cfg.memory_slots, D), param_dtype).astype(compute_dtype)
+        S = jnp.broadcast_to(slots[None], (x.shape[0],) + slots.shape)  # [B, S, D]
+        att = jnp.einsum("bsd,btd->bst", S, x) / jnp.sqrt(D).astype(compute_dtype)
+        w = jax.nn.softmax(att, axis=-1)
+        ctx = jnp.einsum("bst,btd->bsd", w, x)                          # [B, S, D]
+        session = jnp.mean(ctx, axis=1)                                 # [B, D]
+        y = x + session[:, None, :]
+        return nn.LayerNorm(param_dtype=param_dtype, dtype=compute_dtype, name="norm")(y)
+
+
+class ProtogrokModel(nn.Module):
+    """Full two-stage flow Transformer with multi-task heads."""
+
+    cfg: ProtogrokConfig
+
+    @nn.compact
+    def __call__(self, payload_toks: jnp.ndarray, headers: jnp.ndarray,
+                 proto_id: jnp.ndarray, *, task: Task = "anomaly",
+                 deterministic: bool = True) -> jnp.ndarray:
+        cfg = self.cfg
+        compute_dtype, param_dtype = _dtypes(cfg)
+
+        p = PayloadEncoder(cfg, name="payload")(payload_toks)          # [B, T, P]
+        h = HeaderEncoder(cfg, name="header")(headers)                 # [B, H]
+        h_expand = jnp.broadcast_to(h[:, None, :], (h.shape[0], p.shape[1], h.shape[1]))
+        x = jnp.concatenate([p, h_expand], axis=-1)                    # [B, T, P+H]
+        x = nn.Dense(cfg.d_model, param_dtype=param_dtype, dtype=compute_dtype, name="join")(x)
+
+        for i in range(cfg.packet_layers):
+            x = TransformerBlock(cfg, name=f"pblock_{i}")(x, deterministic=deterministic)
+        x = ProtocolAdapter(cfg, name="adapter")(x, proto_id)
+        x = MemoryModule(cfg, name="memory")(x)
+        for i in range(cfg.session_layers):
+            x = TransformerBlock(cfg, name=f"sblock_{i}")(x, deterministic=deterministic)
+
+        pooled = jnp.mean(x, axis=1)                                   # [B, D]
+
+        # Build ALL heads on every call so a single `init` materializes every
+        # task's parameters (shared trunk, multi-task heads). Unused heads are
+        # tiny and their extra compute is negligible.
+        def head(width: int, name: str) -> jnp.ndarray:
+            z = nn.LayerNorm(param_dtype=param_dtype, dtype=compute_dtype, name=f"{name}_ln")(pooled)
+            return nn.Dense(width, param_dtype=param_dtype, dtype=compute_dtype, name=f"{name}_out")(z)
+
+        outputs = {
+            "pooled": pooled,
+            "anomaly": head(2, "anom_head"),
+            "class": head(cfg.num_classes, "class_head"),
+            # byte-decode head (no LayerNorm in the original), on pooled state
+            "protocol": nn.Dense(cfg.byte_vocab, param_dtype=param_dtype,
+                                 dtype=compute_dtype, name="decode_head")(pooled),
+        }
+        if task not in outputs:
+            raise ValueError(f"Unknown task: {task!r}")
+        return outputs[task]
+
+
+def init_params(cfg: ProtogrokConfig, rng: jax.Array, batch: int = 2):
+    """Initialise parameters with a dummy batch; returns the params pytree."""
+    L, T = cfg.payload_max_len, cfg.max_packets
+    payload = jnp.zeros((batch, T, L), jnp.int32)
+    headers = jnp.zeros((batch, 5), jnp.int32)
+    proto = jnp.zeros((batch,), jnp.int32)
+    model = ProtogrokModel(cfg)
+    variables = model.init(rng, payload, headers, proto, task="anomaly", deterministic=True)
+    return model, variables
+
+
+def count_params(params) -> int:
+    return int(sum(x.size for x in jax.tree_util.tree_leaves(params)))

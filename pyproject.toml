@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "protogrok-jax"
+version = "1.0.0"
+description = "Production JAX/Flax port of the Protogrok network anomaly-detection Transformer"
+requires-python = ">=3.10"
+dependencies = [
+    "jax>=0.4.30",
+    "flax>=0.8.5",
+    "optax>=0.2.2",
+    "orbax-checkpoint>=0.5.0",
+    "numpy>=1.24",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+data = ["pandas>=2.0"]
+pcap = ["scapy>=2.5"]
+dev = ["pytest>=7.0", "chex>=0.1.86"]
+
+[tool.setuptools.packages.find]
+include = ["data*", "models*", "optimization*"]

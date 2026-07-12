@@ -1,0 +1,9 @@
+# Training hyper-parameters (consumed by train.py)
+epochs: 3
+batch_size: 32
+peak_lr: 3.0e-4
+warmup_steps: 1000
+weight_decay: 0.01
+grad_clip: 1.0
+seed: 0
+task: anomaly          # anomaly | class
