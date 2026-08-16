@@ -1,0 +1,573 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage[hidelinks]{hyperref}
+\usepackage{url}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single,
+  framesep=4pt,
+  rulecolor=\color{gray!40},
+  columns=fullflexible,
+}
+
+\title{\textbf{Payload Bytes, Not Proxies:}\\
+Diagnosing a Silent Data-Pipeline Failure in a\\
+Transformer-Based Network Intrusion Detector}
+
+\author{%
+  Laalini Bhogadi\\
+  Anvyon LLP\\
+  \texttt{laalinib17@gmail.com}
+}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We report a diagnostic study of a 115.6M-parameter two-stage Transformer for
+network intrusion detection that reached 75\% accuracy and emitted an anomaly
+score confined to the band $[0.80, 0.85]$ regardless of input. The failure was
+not architectural. Payload tensors---the input to the convolutional encoder that
+holds 99\% of the model's parameters---were synthesized by hashing tabular flow
+records. We show this destroys learnable structure: two flows differing only in
+duration (0.100\,s vs.\ 0.101\,s) receive payload tensors with correlation
+$-0.101$ and zero shared bytes out of 128. A gradient-boosted-tree probe
+quantifies the resulting information ceiling at ROC-AUC $0.663$ on the features
+the model actually received, against $0.9835$ on the full feature set. The
+pipeline additionally exhibited a train/serve mismatch: training consumed hashed
+proxies while inference consumed real packet bytes.
+
+Replacing the proxy pipeline with real per-packet payload bytes from UNSW-NB15,
+and unifying tokenization across training and inference, allows a
+0.8M-parameter model to reach ROC-AUC $0.9880$---above the tabular
+ceiling---while a 306.1M model reaches $0.9458$ after a single epoch. We report
+three further findings of practical value: (i) the dispersion of predicted
+scores detects representation collapse where the loss curve does not; (ii) on
+this dataset a 0.8M model outperforms 306M and 517M variants, indicating the
+task is data- rather than capacity-limited; and (iii) some XLA GPU versions
+expand \texttt{float32} compilation of this architecture by a factor of
+${\sim}180$, requesting 193\,GiB for a graph whose compiled footprint is
+2.8\,GB, which we mitigate by mixed-precision compute and a pre-run compilation
+probe. All code, logs, and the trained checkpoint are released.
+\end{abstract}
+
+\section{Introduction}
+
+Machine learning for network intrusion detection has a well-documented
+reproducibility problem. \citet{sommer2010outside} argued that the domain's
+particular structure---extreme class imbalance, high cost of false positives,
+and enormous variability in ``normal'' traffic---makes it unusually easy to
+report strong results that do not transfer. \citet{arp2022dodos} catalogued the
+specific pitfalls that recur in security ML papers, among them sampling bias,
+inappropriate baselines, and \emph{lab-only evaluation} in which a model is
+trained and tested under conditions it will never encounter in deployment.
+
+This paper is an empirical case study of a failure mode adjacent to those
+catalogues but, to our knowledge, not explicitly named: a data pipeline that
+silently supplies an input carrying no learnable signal, while every conventional
+training diagnostic---loss decreasing, no NaNs, checkpoints saving, evaluation
+running---continues to look healthy.
+
+The system under study is a two-stage Transformer over network flows, trained on
+UNSW-NB15 \citep{moustafa2015unsw}. Its released checkpoint achieved 75\%
+accuracy on a binary anomaly task and, when deployed against packet captures,
+returned anomaly probabilities confined to $[0.80, 0.85]$ for every flow---
+attack and benign alike. The natural reading is that the model is
+under-trained or the architecture is unsuited to the task. Neither was correct.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+  \item We diagnose the failure to a data-pipeline defect and quantify it: the
+  payload tensor, which feeds the encoder holding 99\% of parameters, was a
+  deterministic hash of tabular fields and therefore carries no metric structure
+  (Section~\ref{sec:diagnosis}).
+  \item We introduce a simple, model-agnostic \emph{ceiling probe}: fit a
+  gradient-boosted-tree classifier separately on the full feature set and on the
+  features the model actually receives. The gap bounds what any architecture can
+  achieve on the given input (Section~\ref{sec:ceiling}).
+  \item We identify a train/serve tokenization mismatch in which the deployed
+  model was served a distribution it had never trained on, and eliminate it by
+  construction with a shared tokenizer and an equivalence test
+  (Section~\ref{sec:skew}).
+  \item We report that \emph{score dispersion} is a more reliable collapse
+  detector than loss, and recommend logging it as standard practice
+  (Section~\ref{sec:dispersion}).
+  \item We document a systems failure in which \texttt{float32} compilation of
+  this architecture expands ${\sim}180\times$ on some XLA GPU versions, and
+  release a preflight tool that catches such cases in about a minute
+  (Section~\ref{sec:systems}).
+\end{enumerate}
+
+\section{System Under Study}
+\label{sec:system}
+
+\subsection{Architecture}
+
+The model processes a network flow as a sequence of $T$ packets, each truncated
+to $L$ payload bytes. Writing $B$ for batch size:
+
+\begin{enumerate}
+  \item \textbf{Payload encoder.} Byte embedding over a vocabulary of $259$
+  (256 byte values plus \textsc{pad}, \textsc{bos}, \textsc{eos}), learned
+  positional embeddings, two 1-D convolutions with kernel width 3 and GELU
+  activation, then mean-pooling over the byte axis. Input
+  $[B, T, L] \to [B, T, E]$.
+  \item \textbf{Header encoder.} Protocol and port-bucket embeddings
+  concatenated with a projection of scalar header fields.
+  \item \textbf{Packet stage.} $N_p$ pre-norm Transformer blocks
+  \citep{vaswani2017attention} over the $T$ packet representations.
+  \item \textbf{Protocol adapter.} A protocol embedding plus a bottleneck
+  adapter.
+  \item \textbf{Memory module.} Slot attention \citep{locatello2020object} pools
+  packets into $S$ slots, whose mean is broadcast back as a session state.
+  \item \textbf{Session stage.} $N_s$ further Transformer blocks, mean-pooled,
+  feeding anomaly, traffic-class, and byte-decode heads.
+\end{enumerate}
+
+We use $L = 128$, $T = 16$, and $S = 8$ throughout. Three configurations are
+studied, at $115{,}643{,}015$, $306{,}103{,}367$, and $517{,}221{,}903$
+parameters. In all of them the Transformer blocks account for 98--99\% of
+parameters, and the payload encoder is the only component operating on
+$T \times L = 2048$ positions per sample rather than $T = 16$.
+
+\subsection{The original data pipeline}
+
+UNSW-NB15's widely used partitioned CSVs contain flow \emph{statistics}---
+duration, byte and packet counts, TTLs, load, jitter, connection counters---but
+no packet bytes. To supply the byte-level input the payload encoder requires,
+the original pipeline synthesized one:
+
+\begin{lstlisting}[language=Python]
+def hash_bytes_from_fields(values, length):
+    s = "|".join(str(v) for v in values).encode("utf-8")
+    seed = int.from_bytes(hashlib.blake2b(s, digest_size=8).digest(),
+                          "little") % (2 ** 32)
+    rng = np.random.default_rng(seed)
+    return rng.integers(0, 256, size=length, dtype=np.uint8).tobytes()
+\end{lstlisting}
+
+Each flow's fields are hashed to a seed, and a pseudo-random byte string is
+drawn from it. The mapping is deterministic and reproducible, which is presumably
+why it passed review.
+
+\section{Diagnosis}
+\label{sec:diagnosis}
+
+\subsection{Symptom}
+
+Training logs show validation accuracy identical across consecutive epochs
+($0.7471$, $0.7471$), and a released checkpoint scoring $0.75$ accuracy with
+macro-$F_1$ $0.7468$. At inference the model returned scores in
+$[0.8008, 0.8524]$ across all evaluated captures. A frozen score band with a
+decreasing loss is the signature of a model that has learned the class prior and
+nothing else.
+
+\subsection{Hash proxies carry no learnable structure}
+
+A hash is designed to destroy locality: inputs that are close in the source
+space map to outputs that are uncorrelated. Neural networks require the
+opposite. We measured the effect directly on two flows differing only in
+duration ($0.100$\,s vs.\ $0.101$\,s), holding all other fields fixed:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lr}
+\toprule
+Quantity & Value \\
+\midrule
+Pearson correlation of the two payload tensors & $-0.101$ \\
+Identical bytes (of 128) & $0$ \\
+Correlation of a row with itself & $1.000$ \\
+\bottomrule
+\end{tabular}
+\caption{Near-identical flows receive uncorrelated payload tensors. The mapping
+is reproducible (correlation 1.0 on repeat), so the input is memorizable but not
+generalizable---a one-time pad keyed by the record.}
+\label{tab:hash}
+\end{table}
+
+A second, independent defect compounded this. The loader reads columns
+\texttt{sport} and \texttt{dsport}, which do not exist in the UNSW-NB15
+partitioned CSVs. Pandas' \texttt{Series.get} returns the supplied default
+silently, so both port buckets were constant for every record. The header vector
+reaching the model was therefore
+$[\texttt{proto\_id}, 0, 0, \min(n_{\text{pkts}}, 16), 0]$: of 42 available
+fields, exactly two carried information.
+
+\subsection{Quantifying the information ceiling}
+\label{sec:ceiling}
+
+To separate ``the model is bad'' from ``the input is impoverished,'' we fit a
+gradient-boosted-tree classifier \citep{friedman2001greedy} twice: once on the
+full tabular feature set, and once on only the two features the Transformer
+actually received. Training used the 175{,}341-record partition, evaluation the
+82{,}332-record partition.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\toprule
+Input & Accuracy & Macro $F_1$ & ROC-AUC \\
+\midrule
+All 42 tabular features & $0.8728$ & $0.8672$ & $\mathbf{0.9835}$ \\
+Only $[\texttt{proto}, \min(n_{\text{pkts}},16)]$ & $0.6630$ & $0.5864$ & --- \\
+Majority class & $0.5506$ & --- & --- \\
+\bottomrule
+\end{tabular}
+\caption{The ceiling probe. The features reaching the model support at most
+$\approx 0.66$ accuracy; the discarded features support ROC-AUC $0.9835$. The
+reported model accuracy of $0.75$ sits in this gap.}
+\label{tab:ceiling}
+\end{table}
+
+The probe costs seconds to run and bounds what \emph{any} architecture can
+achieve on a given input. We recommend it as a routine check before attributing
+poor performance to model capacity or optimization. Scaling the model under
+these conditions cannot help: additional capacity buys memorization of
+noise, not generalization.
+
+\subsection{Train/serve tokenization mismatch}
+\label{sec:skew}
+
+The inference path parsed real \texttt{.pcap} files, extracted true payload
+bytes, and tokenized them as $\texttt{BYTE\_OFFSET} + b$. Training used hashed
+proxies. The deployed model was therefore evaluated on a distribution it had
+never observed during training---a mismatch sufficient on its own to render the
+scores meaningless, independent of the training defect.
+
+This class of error is difficult to catch by inspection because both paths are
+individually reasonable; only their conjunction is wrong. Our corrected
+implementation exposes one tokenizer used by both paths and asserts their
+equivalence in a unit test over payload lengths
+$\{0, 1, 7, 64, 128\}$, including the case of a genuine \texttt{0x00} payload
+byte, which must map to \texttt{BYTE\_OFFSET} rather than to padding.
+
+\section{Corrected Pipeline}
+\label{sec:corrected}
+
+We replace synthesized bytes with real ones, drawn from the \texttt{Payload-Bytes}
+subset of a packet-level redistribution of UNSW-NB15
+\citep{pahalavan2023nids}, which provides per-packet payload bytes extracted
+from the original captures together with flow identifiers and labels.
+
+Packets are grouped by \texttt{flow\_id}, ordered by \texttt{packet\_id}, and the
+first $T = 16$ retained; the first $L = 128$ bytes of each are tokenized. Because
+Parquet is columnar, reading $130$ of $1485$ columns costs approximately
+$130/1485$ of each file, so the pipeline streams directly from remote storage
+without materializing the 47.9\,GB source. Flows, never packets, are split
+between training and validation, so packets from one flow cannot straddle the
+boundary.
+
+Two further changes follow from properties of the corrected data:
+
+\paragraph{Class weighting.} The true attack rate at flow level is $3.6\%$.
+Unweighted cross-entropy reaches a low loss by predicting ``normal''
+universally---a collapsed detector with a healthy loss curve. We apply
+inverse-frequency weights, computed per split.
+
+\paragraph{Fixed protocol vocabulary.} The tabular loader derived its protocol
+vocabulary from the observed data, while the inference path maps IANA protocol
+numbers modulo a fixed vocabulary size. We fix the vocabulary at 132 in both, so
+that a protocol embedding denotes the same protocol at training and serving time.
+
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Setup}
+
+Preprocessing yields $1{,}593{,}481$ flows from 18 source files
+($1{,}434{,}132$ train / $159{,}349$ validation), reproduced identically across
+three independent runs in two datacenter regions. Training uses AdamW
+\citep{loshchilov2019adamw} with a cosine schedule and linear warmup, gradient
+clipping at global norm 1.0, and batch size 256 on a single NVIDIA H100 80GB.
+We report ROC-AUC as the primary metric: at a $3.6\%$ positive rate, accuracy is
+dominated by the prior, and the class weighting deliberately shifts the optimal
+threshold away from $0.5$.
+
+\subsection{The pipeline fix recovers the signal}
+
+A deliberately small model (0.8M parameters, $d_{\text{model}} = 128$) trained on
+a single shard (89{,}337 flows) establishes that the corrected pipeline carries
+signal:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccccc}
+\toprule
+Epoch & Loss & Accuracy & Macro $F_1$ & ROC-AUC & Score $p_{5}$--$p_{95}$ \\
+\midrule
+1 & $0.3497$ & $0.9400$ & $0.8220$ & $0.9689$ & $0.026$--$0.970$ \\
+2 & $0.1901$ & $0.9609$ & $0.8732$ & $0.9736$ & $0.012$--$0.967$ \\
+3 & $0.1488$ & $0.9665$ & $0.8883$ & $0.9843$ & $0.004$--$0.950$ \\
+4 & $0.1188$ & $0.9710$ & $0.9006$ & $0.9853$ & $0.005$--$0.979$ \\
+5 & $0.0995$ & $0.9457$ & $0.8390$ & $0.9858$ & $0.003$--$0.974$ \\
+6 & $0.0865$ & $0.9715$ & $0.9033$ & $\mathbf{0.9880}$ & $0.003$--$0.976$ \\
+\bottomrule
+\end{tabular}
+\caption{A 0.8M-parameter model on $1/18$ of the data exceeds the $0.9835$
+tabular ceiling of Table~\ref{tab:ceiling}. The architecture was never the
+limiting factor.}
+\label{tab:small}
+\end{table}
+
+Epoch 5 is instructive: accuracy falls ($0.9710 \to 0.9457$) while ROC-AUC
+\emph{rises} ($0.9853 \to 0.9858$). The ranking improved; only the fixed $0.5$
+threshold became less apt. Practitioners monitoring accuracy would have read
+this as a regression.
+
+\subsection{Scale}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrc}
+\toprule
+Model & Parameters & Data & Epochs & ROC-AUC \\
+\midrule
+Protogrok (tiny) & $0.8$M & 1 shard & 6 & $\mathbf{0.9880}$ \\
+GBDT, full tabular features & --- & full & --- & $0.9835$ \\
+Protogrok (large) & $306.1$M & 18 shards & 1 & $0.9458$ \\
+Protogrok (XL), $\eta = 6\!\times\!10^{-4}$ & $517.2$M & 18 shards & 3 & $0.8385$ \\
+Protogrok, hashed proxies & $115.6$M & full CSV & 2 & $\approx 0.66$ ceiling \\
+\bottomrule
+\end{tabular}
+\caption{Capacity does not help on this dataset. The smallest model is the best.}
+\label{tab:scale}
+\end{table}
+
+The 517M configuration at $\eta = 6\times10^{-4}$ oscillated
+($0.8348 \to 0.8048 \to 0.8385$ over three epochs) with loss decreasing only
+marginally---a learning rate too large for the model width. Halving it to
+$2.5\times10^{-4}$ for the 306M configuration moved first-epoch ROC-AUC from
+$0.8348$ to $0.9458$ and widened the score range from $[0.301, 0.926]$ to
+$[0.007, 0.969]$.
+
+We emphasize the negative result in Table~\ref{tab:scale}. With
+$1.43\times10^{6}$ training flows and 42 underlying features, a
+$3\times10^{8}$-parameter model has roughly 200 parameters per training example.
+The task is data-limited, not capacity-limited, and the original instinct to
+scale to 500M parameters was the wrong axis of improvement.
+
+\subsection{Score dispersion detects collapse}
+\label{sec:dispersion}
+
+Across every run, the interval between the 5th and 95th percentiles of the
+predicted anomaly probability separated working from collapsed models more
+reliably than the loss:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llc}
+\toprule
+Condition & Score $p_5$--$p_{95}$ & Status \\
+\midrule
+Hashed proxies, deployed & $0.801$--$0.852$ & collapsed \\
+517M, $\eta$ too large & $0.301$--$0.926$ & partially collapsed \\
+306M, corrected $\eta$ & $0.007$--$0.969$ & healthy \\
+0.8M, corrected pipeline & $0.003$--$0.976$ & healthy \\
+\bottomrule
+\end{tabular}
+\caption{Score dispersion as a collapse diagnostic. In every collapsed case the
+loss curve appeared unremarkable.}
+\label{tab:dispersion}
+\end{table}
+
+The measure costs two percentile computations per evaluation and requires no
+labels. We recommend logging it alongside loss as standard practice for
+imbalanced detection tasks.
+
+\subsection{Out-of-distribution saturation}
+
+The released 306M checkpoint ranks well on held-out UNSW-NB15
+(ROC-AUC $0.9458$) but saturates on captures unlike its training distribution:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccccc}
+\toprule
+Capture & Min & Median & Max & Flagged \\
+\midrule
+Crafted attack traffic & $0.9627$ & $0.9714$ & $0.9933$ & $41/41$ \\
+Crafted benign + scan & $0.9627$ & $0.9715$ & $0.9933$ & $34/34$ \\
+Live capture & $0.6797$ & $0.9570$ & $0.9922$ & $24/24$ \\
+\bottomrule
+\end{tabular}
+\caption{On out-of-distribution captures the attack and benign score
+distributions are indistinguishable. This is precisely the generalization gap
+\citet{sommer2010outside} warned of, and it is invisible to in-distribution
+validation.}
+\label{tab:ood}
+\end{table}
+
+We report this because it is the outcome an in-distribution AUC of $0.9458$ does
+not predict, and because the checkpoint is publicly released: a user who
+evaluated it only on held-out UNSW-NB15 would substantially overestimate its
+utility.
+
+\section{Systems Findings}
+\label{sec:systems}
+
+\subsection{A \texttt{float32} compilation blowup}
+
+Three training attempts differing in one variable:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\toprule
+Configuration & Batch & Compute dtype & Outcome \\
+\midrule
+$115.6$M & 32 & \texttt{float32} & OOM, $193.78$\,GiB requested \\
+$306.1$M & 256 & \texttt{float32} & OOM, $2.02$\,TiB requested \\
+$517.2$M & 256 & \texttt{bfloat16} & compiled at $15.79$\,GB \\
+\bottomrule
+\end{tabular}
+\caption{Identical code; only the compute dtype differs. The larger model in
+\texttt{bfloat16} compiles comfortably where a model $4.5\times$ smaller in
+\texttt{float32} requests more memory than any accelerator provides.}
+\label{tab:blowup}
+\end{table}
+
+Compiling the same training step for the CPU backend reports a total footprint
+of $2.8$\,GB at batch 32, scaling linearly with batch size, establishing that the
+computation does not require the requested memory. The rematerialization pass
+reported it could not reduce the requirement at all
+(``$193.78$\,GiB down from $193.78$\,GiB''), indicating a single unshrinkable
+buffer rather than accumulated activations. We did not isolate the responsible
+operator; we report the correlation because it is reproducible, severe, and
+silently attributed to model size by anyone who has not measured otherwise.
+
+The practical mitigation is mixed precision---\texttt{bfloat16} compute with
+\texttt{float32} parameters---which is independently desirable on tensor-core
+hardware.
+
+\subsection{Preflight compilation probes}
+
+Because the failure above manifests only after preprocessing and only on the
+target device, we release a tool that compiles the training step across a matrix
+of configuration variants and reports each one's measured footprint before any
+long run. On an H100 80GB at batch 256 for the 517M configuration:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llrrr}
+\toprule
+Conv. implementation & Remat & Temp (GB) & Args (GB) & Total (GB) \\
+\midrule
+\texttt{conv} & no & $9.59$ & $6.21$ & $15.79$ \\
+\texttt{conv} & yes & $4.72$ & $6.21$ & $\mathbf{10.93}$ \\
+\texttt{matmul} & no & $12.27$ & $6.21$ & $18.48$ \\
+\texttt{matmul} & yes & $8.72$ & $6.21$ & $14.93$ \\
+\bottomrule
+\end{tabular}
+\caption{Preflight output. Gradient checkpointing \citep{chen2016training}
+halves activation memory on GPU; on the CPU backend the same setting changes
+nothing ($20.13 \to 20.41$\,GB), so the probe must run on the target device.}
+\label{tab:preflight}
+\end{table}
+
+The probe takes approximately one minute and would have prevented several hours
+of failed accelerator time in our own experiments.
+
+\section{Limitations}
+
+The released checkpoint is trained for a single epoch; the run was terminated by
+a full disk rather than by convergence, and validation AUC was still improving.
+Its threshold is uncalibrated, and Table~\ref{tab:ood} documents that it does not
+separate attack from benign traffic on out-of-distribution captures. We retain
+only the first 16 packets per flow and 128 bytes per packet, whereas flows in
+this corpus average 28 packets and median payloads of approximately 1300 bytes;
+most of each payload is therefore unobserved. Rare attack classes are extremely
+sparse (155 worms, 401 backdoor, 435 analysis out of $1.59\times10^6$ flows), so
+the multi-class head is not evaluated here. Finally, all results are on a single
+dataset; UNSW-NB15 is synthetic in its attack generation, and the
+generalization concerns raised by \citet{sommer2010outside} apply in full.
+
+\section{Conclusion}
+
+The model examined here appeared to be a capacity or optimization problem and was
+in fact a data problem. The diagnostic sequence that resolved it---measure
+whether the input carries structure, bound the achievable performance with a
+cheap non-neural probe, verify that training and serving consume the same
+representation, and monitor score dispersion rather than loss alone---is
+inexpensive and generalizes beyond this system. We note that our own initial
+instinct, to scale from 115M to 500M parameters, would have made the situation
+worse while appearing to be progress; the smallest model we trained remains the
+best-performing.
+
+\section*{Availability}
+
+Code, training logs including all failed runs, and the trained checkpoint are
+released under Apache 2.0 at
+\url{https://github.com/Laalinibh/protogrok-jax} and
+\url{https://huggingface.co/Anvyon/protogrok-jax-306m}.
+
+\bibliographystyle{plainnat}
+\begin{thebibliography}{9}
+
+\bibitem[Arp et al.(2022)]{arp2022dodos}
+D.~Arp, E.~Quiring, F.~Pendlebury, A.~Warnecke, F.~Pierazzi, C.~Wressnegger,
+L.~Cavallaro, and K.~Rieck.
+\newblock Dos and don'ts of machine learning in computer security.
+\newblock In \emph{USENIX Security Symposium}, 2022.
+
+\bibitem[Chen et al.(2016)]{chen2016training}
+T.~Chen, B.~Xu, C.~Zhang, and C.~Guestrin.
+\newblock Training deep nets with sublinear memory cost.
+\newblock \emph{arXiv:1604.06174}, 2016.
+
+\bibitem[Friedman(2001)]{friedman2001greedy}
+J.~H. Friedman.
+\newblock Greedy function approximation: A gradient boosting machine.
+\newblock \emph{Annals of Statistics}, 29(5):1189--1232, 2001.
+
+\bibitem[Locatello et al.(2020)]{locatello2020object}
+F.~Locatello, D.~Weissenborn, T.~Unterthiner, A.~Mahendran, G.~Heigold,
+J.~Uszkoreit, A.~Dosovitskiy, and T.~Kipf.
+\newblock Object-centric learning with slot attention.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2020.
+
+\bibitem[Loshchilov and Hutter(2019)]{loshchilov2019adamw}
+I.~Loshchilov and F.~Hutter.
+\newblock Decoupled weight decay regularization.
+\newblock In \emph{International Conference on Learning Representations}, 2019.
+
+\bibitem[Moustafa and Slay(2015)]{moustafa2015unsw}
+N.~Moustafa and J.~Slay.
+\newblock UNSW-NB15: A comprehensive data set for network intrusion detection
+systems.
+\newblock In \emph{Military Communications and Information Systems Conference
+(MilCIS)}, 2015.
+
+\bibitem[Pahalavan(2023)]{pahalavan2023nids}
+R.~D. Pahalavan.
+\newblock nids-datasets: Packet-level and flow-level data from UNSW-NB15 and
+CIC-IDS2017.
+\newblock \url{https://github.com/rdpahalavan/nids-datasets}, 2023.
+
+\bibitem[Sommer and Paxson(2010)]{sommer2010outside}
+R.~Sommer and V.~Paxson.
+\newblock Outside the closed world: On using machine learning for network
+intrusion detection.
+\newblock In \emph{IEEE Symposium on Security and Privacy}, 2010.
+
+\bibitem[Vaswani et al.(2017)]{vaswani2017attention}
+A.~Vaswani, N.~Shazeer, N.~Parmar, J.~Uszkoreit, L.~Jones, A.~N. Gomez,
+{\L}.~Kaiser, and I.~Polosukhin.
+\newblock Attention is all you need.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2017.
+
+\end{thebibliography}
+
+\end{document}
