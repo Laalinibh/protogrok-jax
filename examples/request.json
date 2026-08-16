@@ -1,0 +1,8 @@
+{
+  "inputs": "1MOyoQIABAAAAAAAAAAAAP//AADkAAAAdll/aheMBgBXAAAAVwAAAEUAAFcAAQAA...<base64 pcap, truncated for readability>...",
+  "parameters": {
+    "threshold": 0.5,
+    "diagnose": true,
+    "max_flows": 200
+  }
+}

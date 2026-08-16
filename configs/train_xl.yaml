@@ -1,0 +1,18 @@
+# Training config for the full UNSW-NB15 packet-byte corpus on one A100/H100.
+#
+# batch_size 256 keeps an 80 GB card busy: 517M params need ~8 GB for
+# fp32 weights + grads + Adam moments, leaving ~70 GB for activations.
+# Drop to 128 on a 40 GB card.
+#
+# peak_lr is scaled for batch 256. The model sits on a loss plateau for the
+# first few thousand steps before the payload encoder starts separating
+# classes -- do not kill the run early, and do not lower the LR to "fix" a
+# flat start. That plateau is what the original 2-epoch run never escaped.
+epochs: 10
+batch_size: 256
+peak_lr: 6.0e-4
+warmup_steps: 1000
+weight_decay: 0.01
+grad_clip: 1.0
+seed: 0
+task: anomaly

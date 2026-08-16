@@ -1,0 +1,8 @@
+epochs: 2
+batch_size: 32
+peak_lr: 3.0e-4
+warmup_steps: 20
+weight_decay: 0.01
+grad_clip: 1.0
+seed: 0
+task: anomaly

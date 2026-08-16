@@ -75,8 +75,20 @@ def _dummy_inputs(cfg: ProtogrokConfig):
 # --------------------------------------------------------------------------- #
 # Loss / metrics
 # --------------------------------------------------------------------------- #
-def softmax_ce(logits: jnp.ndarray, labels: jnp.ndarray) -> jnp.ndarray:
-    return optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
+def softmax_ce(logits: jnp.ndarray, labels: jnp.ndarray,
+               weights: jnp.ndarray | None = None) -> jnp.ndarray:
+    """Cross-entropy, optionally re-weighted per example.
+
+    Real UNSW-NB15 traffic is ~5% attack, so an unweighted mean lets the model
+    reach a low loss by predicting "normal" for everything -- a collapsed head
+    with a healthy-looking loss curve. Passing inverse-frequency weights keeps
+    the minority class in the gradient.
+    """
+    losses = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
+    if weights is None:
+        return losses.mean()
+    w = weights.astype(losses.dtype)
+    return (losses * w).sum() / jnp.maximum(w.sum(), 1e-8)
 
 
 def accuracy(logits: jnp.ndarray, labels: jnp.ndarray) -> jnp.ndarray:
@@ -95,7 +107,7 @@ def train_step(state: TrainState, batch: Dict[str, jnp.ndarray], task: str = "an
         logits = state.apply_fn(
             {"params": params}, batch["payload"], batch["headers"], batch["proto_id"],
             task=task, deterministic=False, rngs={"dropout": dropout_rng})
-        loss = softmax_ce(logits, batch["labels"])
+        loss = softmax_ce(logits, batch["labels"], batch.get("weights"))
         return loss, logits
 
     (loss, logits), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)

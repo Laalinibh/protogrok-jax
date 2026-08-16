@@ -1,0 +1,54 @@
+{
+  "model": {
+    "d_model": 1024,
+    "params": 306103367
+  },
+  "n_flows": 41,
+  "truncated": false,
+  "results": [
+    {
+      "flow": "10.0.0.5:54321 -> 10.0.0.10:80 (proto 6)",
+      "packets": 3,
+      "anomaly_score": 0.96875,
+      "anomaly": true,
+      "mismatch_findings": [],
+      "mismatch_detected": false,
+      "root_cause": {
+        "tag": "model_flagged_anomaly",
+        "label": "Model flagged this flow as anomalous; no specific structural cause matched",
+        "confidence": 0.96875,
+        "reasoning": [
+          "No structural rule matched, but the Protogrok model's P(anomaly) = 0.969 >= threshold 0.50; flagging for manual review \u2014 this is the model's learned judgement, not a rule."
+        ],
+        "contributing_findings": []
+      },
+      "suggested_actions": [
+        "No specific rule fired, but the model's learned score is high \u2014 queue for manual analyst review rather than auto-remediating.",
+        "If this repeats for the same flow signature, consider adding a dedicated structural rule for it in diagnostics/mismatch.py.",
+        "Re-run with a model checkpoint trained on real labelled traffic (e.g. UNSW-NB15) if you are still on a smoke-test/synthetic checkpoint \u2014 untrained models over-flag indiscriminately."
+      ]
+    },
+    {
+      "flow": "10.0.0.10:80 -> 10.0.0.5:54321 (proto 6)",
+      "packets": 3,
+      "anomaly_score": 0.95703125,
+      "anomaly": true,
+      "mismatch_findings": [],
+      "mismatch_detected": false,
+      "root_cause": {
+        "tag": "model_flagged_anomaly",
+        "label": "Model flagged this flow as anomalous; no specific structural cause matched",
+        "confidence": 0.95703125,
+        "reasoning": [
+          "No structural rule matched, but the Protogrok model's P(anomaly) = 0.957 >= threshold 0.50; flagging for manual review \u2014 this is the model's learned judgement, not a rule."
+        ],
+        "contributing_findings": []
+      },
+      "suggested_actions": [
+        "No specific rule fired, but the model's learned score is high \u2014 queue for manual analyst review rather than auto-remediating.",
+        "If this repeats for the same flow signature, consider adding a dedicated structural rule for it in diagnostics/mismatch.py.",
+        "Re-run with a model checkpoint trained on real labelled traffic (e.g. UNSW-NB15) if you are still on a smoke-test/synthetic checkpoint \u2014 untrained models over-flag indiscriminately."
+      ]
+    }
+  ]
+}

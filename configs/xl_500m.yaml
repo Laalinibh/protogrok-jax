@@ -1,0 +1,29 @@
+# Protogrok ~500M configuration.
+#
+# Only worth training on the real packet-byte pipeline (data/packets.py) --
+# on the tabular hash-proxy path the model receives two genuine features
+# (proto, packet count), so extra capacity buys memorisation, not accuracy.
+#
+# 26 transformer blocks x ~12*d_model^2 params each dominates the total.
+# Verify with:  python -c "from models.config import ProtogrokConfig; ..."
+# or tools/count_params.py.
+d_model: 1280
+payload_dim: 640
+header_dim: 448
+packet_layers: 18
+session_layers: 8
+nhead: 20                # 1280 / 20 = 64 per head
+mlp_ratio: 4
+memory_slots: 8
+dropout_rate: 0.1
+
+proto_vocab: 132         # fixed, NOT derived from data: data/pcap.py maps the
+                         # IP protocol number with `% proto_vocab` at inference,
+                         # so training must use the same id space.
+num_classes: 10          # UNSW-NB15 traffic classes (see data.packets.ATTACK_CLASSES)
+dtype: bfloat16          # mixed precision for GPU; use float32 on CPU
+param_dtype: float32
+
+# Gradient checkpointing: bounds peak activation memory at the cost of
+# ~30%% more compute. Standard for a model this size on GPU.
+remat: true

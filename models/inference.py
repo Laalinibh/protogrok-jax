@@ -1,15 +1,22 @@
 """Inference / evaluation utilities: anomaly scoring over flows and metrics."""
 from __future__ import annotations
 
-from typing import Dict, List, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from models.config import ProtogrokConfig
-from data.tokenizer import Batch, iterate_batches
 from models.protogrok import ProtogrokModel
+
+# Imported lazily to keep `models` and `data` from forming an import cycle:
+# data.tokenizer imports models.config, which executes models/__init__, which
+# would re-enter a half-initialised data.tokenizer. `from __future__ import
+# annotations` makes the Batch annotation below a string, so no runtime import
+# is needed for it.
+if TYPE_CHECKING:
+    from data.tokenizer import Batch
 
 
 def macro_f1(logits: np.ndarray, labels: np.ndarray, num_classes: int) -> float:
@@ -52,6 +59,8 @@ def evaluate(cfg: ProtogrokConfig, params, examples: Sequence,
              *, task: str = "anomaly", batch_size: int = 64,
              num_classes: int = 2) -> Dict[str, float]:
     """Aggregate accuracy / macro-F1 over a dataset."""
+    from data.tokenizer import iterate_batches  # local: see import note above
+
     apply = make_apply(cfg, params)
     all_logits: List[np.ndarray] = []
     all_labels: List[np.ndarray] = []

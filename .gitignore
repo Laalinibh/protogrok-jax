@@ -1,32 +1,17 @@
-# Virtual environments
-.venv/
-venv/
-env/
-
-# Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.egg-info/
-.eggs/
-build/
-dist/
 .pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.ipynb_checkpoints/
+.venv/
+venv/
+*.egg-info/
 
-# Checkpoints / artifacts / data
-checkpoints/
+# Model weights live on the HuggingFace Hub, not in git (1.2 GB).
 *.msgpack
-*.npz
-*.orbax-checkpoint*
-data/*.csv
-*.pcap
-wandb/
+checkpoints/
+shards/
+*.parquet
 
-# OS / editor
-.DS_Store
-.idea/
-.vscode/
-*.swp
+# Local captures
+*.pcap
+*.pcapng
+!examples/*.pcap

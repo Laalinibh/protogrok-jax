@@ -51,6 +51,20 @@ class ProtogrokConfig:
     dtype: str = "float32"         # compute dtype; "bfloat16" for TPU/GPU training
     param_dtype: str = "float32"
 
+    #: How PayloadEncoder's two 1D convolutions are implemented. "conv" uses
+    #: ``nn.Conv``; "matmul" uses mathematically identical shifted matmuls with
+    #: the same parameter shapes. Some XLA:GPU versions expand the convolution
+    #: over the [B*T, L, E] payload tensor into a buffer orders of magnitude
+    #: larger than the model needs -- "matmul" avoids that path. Checkpoints are
+    #: interchangeable between the two.
+    payload_conv_impl: str = "conv"
+
+    #: Gradient checkpointing on the transformer blocks. Trades ~30% extra
+    #: compute for a large drop in peak activation memory, and prevents XLA
+    #: from holding the whole layer stack live in one fusion. Recommended on
+    #: GPU; harmless on CPU.
+    remat: bool = False
+
     @property
     def bottleneck(self) -> int:
         return max(128, self.d_model // 8)

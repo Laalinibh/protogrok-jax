@@ -15,7 +15,7 @@ returns      : float [B, C]      task logits (C depends on ``task``)
 """
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
@@ -28,6 +28,40 @@ Task = Literal["anomaly", "class", "protocol", "pooled"]
 
 def _dtypes(cfg: ProtogrokConfig):
     return jnp.dtype(cfg.dtype), jnp.dtype(cfg.param_dtype)
+
+
+class Conv1dMatmul(nn.Module):
+    """``nn.Conv(kernel_size=(3,), padding="SAME")`` expressed as 3 matmuls.
+
+    Parameter names and shapes are identical to ``nn.Conv`` (``kernel``
+    ``[k, in, out]``, ``bias`` ``[out]``), so checkpoints interoperate freely
+    with the ``nn.Conv`` implementation and either can be swapped in.
+
+    Why this exists: on some XLA:GPU versions the 1D convolution over the
+    ``[B*T, L, E]`` payload tensor triggers a catastrophic im2col-style
+    expansion (observed: a 193 GiB buffer request for a model whose compiled
+    footprint is 2.8 GB on CPU). Writing it as explicit shifted matmuls keeps
+    the maths identical while bypassing convolution algorithm selection.
+    """
+
+    features: int
+    kernel_size: int = 3
+    param_dtype: Any = jnp.float32
+    dtype: Any = jnp.float32
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:      # [N, L, C] -> [N, L, F]
+        k, C, F = self.kernel_size, x.shape[-1], self.features
+        kernel = self.param("kernel", nn.initializers.lecun_normal(),
+                            (k, C, F), self.param_dtype).astype(self.dtype)
+        bias = self.param("bias", nn.initializers.zeros_init(),
+                          (F,), self.param_dtype).astype(self.dtype)
+        # "SAME" for an odd kernel and stride 1 pads (k-1)//2 on each side.
+        pad = (k - 1) // 2
+        xp = jnp.pad(x, ((0, 0), (pad, pad), (0, 0)))
+        L = x.shape[1]
+        out = sum(xp[:, i:i + L, :] @ kernel[i] for i in range(k))
+        return out + bias
 
 
 class PayloadEncoder(nn.Module):
@@ -60,10 +94,16 @@ class PayloadEncoder(nn.Module):
         x = x * pad_mask
         x = x + pos[:L][None].astype(compute_dtype)                      # [B*T, L, E]
 
-        conv_kwargs = dict(features=E, kernel_size=(3,), padding="SAME",
-                           param_dtype=param_dtype, dtype=compute_dtype)
-        x = nn.gelu(nn.Conv(**conv_kwargs, name="conv0")(x), approximate=False)
-        x = nn.gelu(nn.Conv(**conv_kwargs, name="conv1")(x), approximate=False)
+        if cfg.payload_conv_impl == "matmul":
+            make_conv = lambda name: Conv1dMatmul(  # noqa: E731
+                features=E, kernel_size=3, param_dtype=param_dtype,
+                dtype=compute_dtype, name=name)
+        else:
+            make_conv = lambda name: nn.Conv(  # noqa: E731
+                features=E, kernel_size=(3,), padding="SAME",
+                param_dtype=param_dtype, dtype=compute_dtype, name=name)
+        x = nn.gelu(make_conv("conv0")(x), approximate=False)
+        x = nn.gelu(make_conv("conv1")(x), approximate=False)
         x = jnp.mean(x, axis=1)                                          # AdaptiveAvgPool1d(1)
         return x.reshape(B, T, E)
 
@@ -97,7 +137,9 @@ class TransformerBlock(nn.Module):
     cfg: ProtogrokConfig
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, *, deterministic: bool) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
+        # `deterministic` is positional-or-keyword (not keyword-only) so this
+        # block can be wrapped in nn.remat with static_argnums.
         cfg = self.cfg
         compute_dtype, param_dtype = _dtypes(cfg)
         hidden = cfg.d_model * cfg.mlp_ratio
@@ -174,12 +216,18 @@ class ProtogrokModel(nn.Module):
         x = jnp.concatenate([p, h_expand], axis=-1)                    # [B, T, P+H]
         x = nn.Dense(cfg.d_model, param_dtype=param_dtype, dtype=compute_dtype, name="join")(x)
 
+        # nn.remat recomputes each block's activations during the backward pass
+        # instead of keeping them live. It bounds peak activation memory to one
+        # block, which stops a bad XLA fusion from ballooning the whole stack.
+        # static_argnums=(2,) marks `deterministic` (self=0, x=1) as static.
+        Block = nn.remat(TransformerBlock, static_argnums=(2,)) if cfg.remat \
+            else TransformerBlock
         for i in range(cfg.packet_layers):
-            x = TransformerBlock(cfg, name=f"pblock_{i}")(x, deterministic=deterministic)
+            x = Block(cfg, name=f"pblock_{i}")(x, deterministic)
         x = ProtocolAdapter(cfg, name="adapter")(x, proto_id)
         x = MemoryModule(cfg, name="memory")(x)
         for i in range(cfg.session_layers):
-            x = TransformerBlock(cfg, name=f"sblock_{i}")(x, deterministic=deterministic)
+            x = Block(cfg, name=f"sblock_{i}")(x, deterministic)
 
         pooled = jnp.mean(x, axis=1)                                   # [B, D]
 

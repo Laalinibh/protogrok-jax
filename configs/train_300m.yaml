@@ -1,0 +1,16 @@
+# Training config for large_300m.yaml (306.1M) on the full packet corpus.
+#
+# peak_lr is deliberately well below the 6e-4 used for the 517M attempt, which
+# oscillated (AUC 0.835 -> 0.805 -> 0.839) while the loss barely moved -- the
+# signature of a learning rate too high for the model width. Warmup is longer
+# for the same reason.
+#
+# large_300m.yaml is float32, so bfloat16 precision is out of the picture too.
+epochs: 6
+batch_size: 256
+peak_lr: 2.5e-4
+warmup_steps: 1500
+weight_decay: 0.01
+grad_clip: 1.0
+seed: 0
+task: anomaly
